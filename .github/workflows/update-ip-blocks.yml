@@ -1,0 +1,101 @@
+name: Update Country IP Blocks
+
+on:
+  schedule:
+    - cron: '0 2 * * 1'  # Every Monday at 02:00 UTC
+  workflow_dispatch:
+  push:
+    paths:
+      - countries.txt  # Run immediately when a new country is added
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Process countries
+        run: |
+          SOURCE_BASE="https://raw.githubusercontent.com/ipverse/country-ip-blocks/master/country"
+          CHUNK=450
+          ANY_CHANGED=false
+
+          while IFS= read -r CC || [ -n "$CC" ]; do
+            # Skip empty lines and comments
+            [[ -z "$CC" || "$CC" == \#* ]] && continue
+
+            CC=$(echo "$CC" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+            echo "::group::Processing $CC"
+
+            # Download
+            URL="${SOURCE_BASE}/${CC}/ipv4-aggregated.txt"
+            if ! curl -fsSL "$URL" | grep -v '^#' | grep -v '^$' > "/tmp/${CC}-ipv4.txt"; then
+              echo "::warning::Failed to download $URL — skipping $CC"
+              echo "::endgroup::"
+              continue
+            fi
+
+            TOTAL=$(wc -l < "/tmp/${CC}-ipv4.txt")
+            echo "  Downloaded $TOTAL ranges for $CC"
+
+            # Check if source changed
+            NEW_SUM=$(sha256sum "/tmp/${CC}-ipv4.txt" | awk '{print $1}')
+            OLD_SUM=$(cat "${CC}/.checksum" 2>/dev/null || echo "")
+
+            if [ "$NEW_SUM" = "$OLD_SUM" ]; then
+              echo "  Unchanged — skipping"
+              echo "::endgroup::"
+              continue
+            fi
+
+            echo "  Changed — regenerating files"
+            ANY_CHANGED=true
+
+            # Split into chunks
+            mkdir -p "$CC"
+            rm -f "${CC}/${CC}_"*.rsc
+
+            split -l "$CHUNK" --numeric-suffixes=1 --suffix-length=2 \
+              --additional-suffix=.rsc "/tmp/${CC}-ipv4.txt" "${CC}/${CC}_"
+
+            FILES=$(ls "${CC}/${CC}_"*.rsc | wc -l)
+            echo "  Generated $FILES file(s)"
+
+            echo "$NEW_SUM" > "${CC}/.checksum"
+
+            # Write stats file
+            total=0
+            for f in "${CC}/${CC}_"*.rsc; do
+              count=$(wc -l < "$f")
+              total=$((total + count))
+            done
+            echo "$total" > "${CC}/count.txt"
+
+            echo "::endgroup::"
+          done < countries.txt
+
+          echo "any_changed=$ANY_CHANGED" >> "$GITHUB_ENV"
+
+      - name: Commit and push
+        if: env.any_changed == 'true'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add .
+
+          # Build a summary for the commit message
+          SUMMARY=$(
+            while IFS= read -r CC || [ -n "$CC" ]; do
+              [[ -z "$CC" || "$CC" == \#* ]] && continue
+              CC=$(echo "$CC" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+              [ -f "/tmp/${CC}-ipv4.txt" ] && echo "${CC}($(wc -l < /tmp/${CC}-ipv4.txt))"
+            done < countries.txt | paste -sd ', '
+          )
+
+          git commit -m "chore: update IP blocks — ${SUMMARY}"
+          git push

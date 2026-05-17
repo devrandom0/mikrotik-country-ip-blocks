@@ -1,0 +1,220 @@
+# MikroTik Script: Update Country IP Ranges
+# Fetches ip ranges from github.com/devrandom0/mikrotik-country-ip-blocks
+# and adds them to a named address-list.
+# File list is discovered dynamically from the GitHub API.
+# Checksum is fetched first — skips update if unchanged unless forceUpdate=true.
+#
+# Configuration:
+:local country "ir"
+:local listName "ir"
+:local apiUrl ("https://api.github.com/repos/devrandom0/mikrotik-country-ip-blocks/contents/" . $country)
+:local rawBase "https://raw.githubusercontent.com/devrandom0/mikrotik-country-ip-blocks/main"
+
+# Ranges to exclude — add any IP/CIDR you want skipped, or leave empty
+# Example: :local excludeList {"5.22.0.0/17"; "5.56.128.0/21"}
+:local excludeList ({})
+
+# Set to true to wipe the address list instead of updating it
+:local removeList false
+
+# Set to true to force update even if checksum has not changed
+:local forceUpdate false
+
+# Set to true to enable verbose per-entry logging
+:local enableLogs false
+
+:local startTime [:tonum [/system clock get time]]
+:local startDate [/system clock get date]
+:local startClock [/system clock get time]
+:local doExit false
+:log info ("[$startDate $startClock] Country IP Range update started for: " . $country)
+
+# Remove-only mode
+:if ($removeList) do={
+    /ip firewall address-list remove [find list=$listName]
+    :log info ("Address list \"" . $listName . "\" removed")
+    :set doExit true
+}
+
+# Fetch remote checksum
+:local checksumUrl ($rawBase . "/" . $country . "/.checksum")
+:local checksumResult [/tool fetch url=$checksumUrl as-value output=user]
+:if ($checksumResult->"status" != "finished") do={
+    :log error ("Failed to fetch checksum")
+    :error "Aborting: could not retrieve checksum"
+}
+:local remoteChecksum ($checksumResult->"data")
+# Strip newline/CR from checksum
+:local csLen [:len $remoteChecksum]
+:while ($csLen > 0 && ([:pick $remoteChecksum ($csLen - 1) $csLen] = "\n" || [:pick $remoteChecksum ($csLen - 1) $csLen] = "\r")) do={
+    :set remoteChecksum [:pick $remoteChecksum 0 ($csLen - 1)]
+    :set csLen ($csLen - 1)
+}
+:log info ("Remote checksum: " . $remoteChecksum)
+
+# Fetch expected range count
+:local countUrl ($rawBase . "/" . $country . "/count.txt")
+:local countResult [/tool fetch url=$countUrl as-value output=user]
+:local expectedCount 0
+:if ($countResult->"status" = "finished") do={
+    :local countRaw ($countResult->"data")
+    :local cLen [:len $countRaw]
+    :while ($cLen > 0 && ([:pick $countRaw ($cLen - 1) $cLen] = "\n" || [:pick $countRaw ($cLen - 1) $cLen] = "\r")) do={
+        :set countRaw [:pick $countRaw 0 ($cLen - 1)]
+        :set cLen ($cLen - 1)
+    }
+    :set expectedCount [:tonum $countRaw]
+    :log info ("Expected range count: " . $expectedCount)
+} else={
+    :log warning ("Could not fetch count.txt — count verification skipped")
+}
+
+# Check if list is already up to date: same checksum AND correct count
+:local tagPrefix ("auto-" . $country . "-")
+:local tagCurrent ("auto-" . $country . "-" . $remoteChecksum)
+:if (!$forceUpdate) do={
+    :local alreadyCurrent [/ip firewall address-list find list=$listName comment=$tagCurrent]
+    :local localCount [:len $alreadyCurrent]
+    :if ($localCount > 0 && ($expectedCount = 0 || $localCount = $expectedCount)) do={
+        :log info ("Up to date — checksum: " . $remoteChecksum . "  count: " . $localCount . " — skipping. Use forceUpdate=true to override.")
+        :set doExit true
+    }
+    :if ($localCount > 0 && $expectedCount > 0 && $localCount != $expectedCount) do={
+        :log warning ("Checksum matches but count mismatch (local: " . $localCount . "  expected: " . $expectedCount . ") — resuming incomplete import")
+    }
+}
+
+:if (!$doExit) do={
+
+# Collect distinct old tags with minimal memory/cpu:
+# Walk entries once, record each distinct comment that matches our prefix but is NOT tagCurrent.
+# Entries with tagCurrent are kept — the import loop will skip them (already up to date)
+# and only add the missing ones to complete the list.
+:local oldTags ({})
+:local lastSeen ""
+:foreach entry in=[/ip firewall address-list find list=$listName] do={
+    :local c [/ip firewall address-list get $entry comment]
+    :if ([:find $c $tagPrefix] = 0 && $c != $tagCurrent && $c != $lastSeen) do={
+        :set lastSeen $c
+        :local seen false
+        :foreach t in=$oldTags do={ :if ($t = $c) do={ :set seen true } }
+        :if (!$seen) do={ :set oldTags ($oldTags , {$c}) }
+    }
+}
+
+# Fetch directory listing from GitHub API
+:local apiResult [/tool fetch url=$apiUrl as-value output=user http-header-field="Accept: application/vnd.github+json"]
+:if ($apiResult->"status" != "finished") do={
+    :log error ("Failed to fetch file list from GitHub API")
+    :error "Aborting: could not retrieve file list"
+}
+
+# Parse JSON to extract .rsc filenames.
+# The API returns JSON array; each entry has a "name" field.
+# We scan for "name":"<value>" and filter to country_.rsc files.
+:local json ($apiResult->"data")
+:local searchFor "\"name\":\""
+:local pos 0
+:local fileCount 0
+:local rangeAdded 0
+:local rangeUpdated 0
+
+:while (true) do={
+    :local found [:find $json $searchFor $pos]
+    :if ([:typeof $found] = "nil") do={ :set pos -1 }
+    :if ($pos = -1) do={ :break }
+
+    # Extract filename: advance past "name":"
+    :local nameStart ($found + [:len $searchFor])
+    # Find closing quote of the filename
+    :local nameEnd [:find $json "\"" $nameStart]
+    :local fileName [:pick $json $nameStart $nameEnd]
+
+    # Only process files matching <country>_NN.rsc pattern
+    :local expectedPrefix ($country . "_")
+    :local hasPrefix ([:find $fileName $expectedPrefix] = 0)
+    :local hasSuffix ([:typeof [:find $fileName ".rsc"]] != "nil")
+    :if ($hasPrefix && $hasSuffix) do={
+        :local fileUrl ($rawBase . "/" . $country . "/" . $fileName)
+        :log info ("Fetching: " . $fileUrl)
+
+        :local fileResult [/tool fetch url=$fileUrl as-value output=user]
+        :if ($fileResult->"status" = "finished") do={
+            :local content ($fileResult->"data")
+            :local lineStart 0
+            :local contentLen [:len $content]
+            :while ($lineStart < $contentLen) do={
+                :local nlPos [:find $content "\n" $lineStart]
+                :local ip
+                :if ([:typeof $nlPos] = "nil") do={
+                    :set ip [:pick $content $lineStart $contentLen]
+                    :set lineStart $contentLen
+                } else={
+                    :set ip [:pick $content $lineStart $nlPos]
+                    :set lineStart ($nlPos + 1)
+                }
+                # strip carriage return if present (Windows line endings)
+                :if ([:len $ip] > 0 && [:pick $ip ([:len $ip] - 1) [:len $ip]] = "\r") do={
+                    :set ip [:pick $ip 0 ([:len $ip] - 1)]
+                }
+                :if ($ip != "") do={
+                    :local skip false
+                    :if ([:len $excludeList] > 0) do={
+                        :foreach excl in=$excludeList do={
+                            :if ($ip = $excl) do={ :set skip true }
+                        }
+                    }
+                    :if (!$skip) do={
+                        :local existing [/ip firewall address-list find list=$listName address=$ip]
+                        :if ([:len $existing] > 0) do={
+                            # Only write if tag differs (previous run or different checksum)
+                            :local currentComment [/ip firewall address-list get $existing comment]
+                            :if ($currentComment != $tagCurrent) do={
+                                /ip firewall address-list set $existing comment=$tagCurrent
+                                :set rangeUpdated ($rangeUpdated + 1)
+                                :if ($enableLogs) do={ :log info ("updated: " . $ip . " (was: " . $currentComment . ")") }
+                            } else={
+                                :if ($enableLogs) do={ :log info ("skipped: " . $ip . " already current") }
+                            }
+                        } else={
+                            /ip firewall address-list add list=$listName address=$ip comment=$tagCurrent
+                            :set rangeAdded ($rangeAdded + 1)
+                            :if ($enableLogs) do={ :log info ("added: " . $ip) }
+                        }
+                    } else={
+                        :if ($enableLogs) do={ :log info ("excluded: " . $ip) }
+                    }
+                }
+            }
+            :set fileCount ($fileCount + 1)
+            :log info ("Imported: " . $fileName)
+        } else={
+            :log warning ("Failed to fetch: " . $fileName)
+        }
+    }
+
+    :set pos ($found + 1)
+}
+
+# Remove entries from previous runs (stale tags not matching current checksum)
+:local rangeRemoved 0
+:foreach oldTag in=$oldTags do={
+    :local stale [/ip firewall address-list find list=$listName comment=$oldTag]
+    :set rangeRemoved ($rangeRemoved + [:len $stale])
+    :if ($enableLogs) do={ :log info ("removing " . [:len $stale] . " stale entries with tag: " . $oldTag) }
+    /ip firewall address-list remove $stale
+}
+
+:local endTime [:tonum [/system clock get time]]
+:local elapsed ($endTime - $startTime)
+:if ($elapsed < 0) do={ :set elapsed ($elapsed + 86400) }
+
+:local totalImported ($rangeAdded + $rangeUpdated)
+:local countStatus "ok"
+:if ($expectedCount > 0 && $totalImported != $expectedCount) do={
+    :set countStatus ("MISMATCH — expected " . $expectedCount . " got " . $totalImported)
+    :log warning ("Range count mismatch for " . $country . ": expected " . $expectedCount . " got " . $totalImported)
+}
+:log info ("Country IP Range update complete — country: " . $country . "  checksum: " . $remoteChecksum . "  count: " . $countStatus . "  files: " . $fileCount . "  added: " . $rangeAdded . "  updated: " . $rangeUpdated . "  removed: " . $rangeRemoved . "  duration: " . $elapsed . "s  list: " . $listName)
+
+}
